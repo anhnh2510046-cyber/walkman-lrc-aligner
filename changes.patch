@@ -1,0 +1,519 @@
+From acc4025fbfa4b0c271c3c6a65502ab333ec81c2d Mon Sep 17 00:00:00 2001
+From: Hong Anh Nguyen <anhnh.2510046@usth.edu.vn>
+Date: Wed, 4 Nov 2026 12:52:57 +0000
+Subject: [PATCH] Implement interactive local Walkman LRC alignment workflow
+
+---
+ README.md                      | 69 +++++++++++++++++++++++++++++-
+ aligner.py                     | 41 ++++++++++++++++++
+ comparator.py                  | 57 +++++++++++++++++++++++++
+ genius_fetcher.py              | 46 ++++++++++++++++++++
+ main.py                        | 78 ++++++++++++++++++++++++++++++++++
+ requirements.txt               |  6 +++
+ scanner.py                     | 51 ++++++++++++++++++++++
+ specs/001-walkman-lrc/tasks.md | 12 +++---
+ tests/test_workflow.py         | 76 +++++++++++++++++++++++++++++++++
+ 9 files changed, 429 insertions(+), 7 deletions(-)
+ create mode 100644 aligner.py
+ create mode 100644 comparator.py
+ create mode 100644 genius_fetcher.py
+ create mode 100644 main.py
+ create mode 100644 requirements.txt
+ create mode 100644 scanner.py
+ create mode 100644 tests/test_workflow.py
+
+diff --git a/README.md b/README.md
+index f870a36..cad1e8a 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,68 @@
+-# walkman-lrc-aligner
+\ No newline at end of file
++# Walkman LRC Aligner
++
++Interactive Python CLI for creating synchronized lyrics next to Walkman audio.
++It follows the constitution and specification in `.specify/memory/constitution.md`
++and `specs/001-walkman-lrc/`. Audio processing runs locally; Genius uses its free
++API and website. No paid API is used.
++
++## Local installation
++
++Use Python 3.10–3.12 and install FFmpeg on your PATH (for example,
++`sudo apt install ffmpeg` on Debian/Ubuntu).
++
++```sh
++python3 -m venv .venv
++. .venv/bin/activate
++python -m pip install -r requirements.txt
++```
++
++On Windows, activate with `.venv\Scripts\activate`. CPU is the default; CUDA
++requires a compatible PyTorch/CTranslate2 installation and NVIDIA libraries.
++The first transcription/alignment run downloads model weights. Subsequent runs
++can use cached weights; use `--model` and `--alignment-model` to select local
++models/checkpoints for offline operation. These two engines use different model
++formats. Model downloads and Genius lookup require Internet access.
++
++For Genius lookup, create a free Genius API client and set
++`GENIUS_ACCESS_TOKEN` in your shell/environment. Never commit the token. Without
++it, existing TXT lyrics still work and the CLI offers explicitly approved local
++Whisper generation. Genius API search may still fail if website scraping is blocked.
++
++## Usage
++
++```sh
++python main.py /path/to/Walkman/MUSIC --scan-only
++python main.py /path/to/Walkman/MUSIC --language en
++python main.py /path/to/Walkman/MUSIC --language vi --model small
++```
++
++The scanner recursively finds MP3, FLAC, M4A and WAV files. Tracks with an LRC
++sidecar are skipped. Existing UTF-8 TXT sidecars bypass Genius search. Metadata
++comes from Mutagen, with a cleaned `Artist - Title` filename fallback.
++
++Genius candidates display four lyric lines and require Y/N/R confirmation.
++N/R or a failed search prompts for another title; a blank title ends searching.
++Whisper-only lyrics always require explicit consent. The console comparison
++matches canonical lines against ordered Whisper segment windows with RapidFuzz.
++It normalizes punctuation and `STR8` for comparison while keeping the original
++lyrics unchanged. This is a review aid, not a phonetic recognizer: check uncertain
++matches yourself. Decline alignment and edit the TXT manually when needed.
++
++After review, stable-ts forces the approved lines onto the audio and writes
++`[mm:ss.xx] Lyrics` LRC entries. A line-count mismatch fails without exporting an
++LRC. New TXT/LRC files use exclusive creation: existing sidecars and original
++audio are never overwritten. A failed LRC write may leave the newly approved TXT
++for the next run. Interrupted runs can be restarted. Avoid concurrent writers
++or duplicate audio basenames sharing sidecars. Exit status is 1 for track errors,
++130 for interruption, and 0 otherwise (including user skips).
++
++## Checks
++
++```sh
++python -m unittest discover -s tests -v
++python main.py --help
++```
++
++Unit tests use model/API doubles; a real audio run additionally requires installed
++dependencies, weights, an audio fixture and interactive approval. No models or
++credentials are bundled.
+diff --git a/aligner.py b/aligner.py
+new file mode 100644
+index 0000000..ec3786e
+--- /dev/null
++++ b/aligner.py
+@@ -0,0 +1,41 @@
++"""Forced alignment and exclusive, non-destructive sidecar writing."""
++import math
++from pathlib import Path
++
++
++def write_new(path, text):
++    with Path(path).open('x', encoding='utf-8', newline='\n') as handle:
++        handle.write(text)
++
++
++def timestamp(seconds):
++    if not math.isfinite(seconds) or seconds < 0:
++        raise ValueError('Invalid alignment timestamp')
++    centiseconds = int(seconds * 100 + 0.5)
++    minutes, remainder = divmod(centiseconds, 6000)
++    seconds, fraction = divmod(remainder, 100)
++    return f'[{minutes:02d}:{seconds:02d}.{fraction:02d}]'
++
++
++class Aligner:
++    def __init__(self, model='small', device='cpu'):
++        import stable_whisper
++        self.model = stable_whisper.load_model(model, device=device)
++
++    def align(self, path, lyrics, language='en'):
++        lines = [line for line in lyrics.splitlines() if line.strip()]
++        result = self.model.align(str(path), '\n'.join(lines), language=language,
++                                  original_split=True)
++        if result is None or len(result.segments) != len(lines):
++            raise ValueError('Alignment did not preserve canonical line count; no LRC written')
++        entries = []
++        previous = -1.0
++        for line, segment in zip(lines, result.segments):
++            start = float(segment.start)
++            if start < previous:
++                raise ValueError('Alignment timestamps are not ordered')
++            entries.append(f'{timestamp(start)} {line}')
++            previous = start
++        if not entries:
++            raise ValueError('No lyrics aligned')
++        return '\n'.join(entries) + '\n'
+diff --git a/comparator.py b/comparator.py
+new file mode 100644
+index 0000000..bd16e4c
+--- /dev/null
++++ b/comparator.py
+@@ -0,0 +1,57 @@
++"""Local transcription and canonical-line comparison."""
++from dataclasses import dataclass
++import re
++import unicodedata
++
++
++def normalize(text):
++    text = unicodedata.normalize('NFKC', text).casefold()
++    text = re.sub(r'\bstr8\b', 'straight', text)
++    return ' '.join(re.findall(r'\w+', text))
++
++
++@dataclass(frozen=True)
++class Comparison:
++    canonical: str
++    heard: str
++    score: float
++
++
++class Transcriber:
++    def __init__(self, model='small', device='cpu', compute_type='int8'):
++        from faster_whisper import WhisperModel
++        self.model = WhisperModel(model, device=device, compute_type=compute_type)
++
++    def transcribe(self, path, language=None):
++        segments, _ = self.model.transcribe(str(path), language=language, vad_filter=True)
++        return [s.text.strip() for s in segments if s.text.strip()]
++
++
++def compare_lines(lyrics, transcript):
++    """Find ordered segment windows; never silently rewrite canonical lyrics."""
++    from rapidfuzz.fuzz import ratio
++    rows = []
++    cursor = 0
++    for line in lyrics.splitlines():
++        if not line.strip():
++            continue
++        candidates = []
++        for start in range(cursor, len(transcript)):
++            for end in range(start + 1, min(start + 4, len(transcript)) + 1):
++                heard = ' '.join(transcript[start:end])
++                candidates.append((ratio(normalize(line), normalize(heard)), start, end, heard))
++        if candidates:
++            score, start, end, heard = max(candidates, key=lambda x: (x[0], -x[1], -x[2]))
++            # Reuse a segment when Whisper put several canonical lines in it.
++            cursor = start
++            rows.append(Comparison(line, heard, score))
++        else:
++            rows.append(Comparison(line, '', 0.0))
++    return rows
++
++
++def show_diff(rows, output=print):
++    output('Match | Canonical lyrics | Whisper transcript')
++    for row in rows:
++        output(f'{row.score:5.1f}% | {row.canonical} | {row.heard}')
++    output('Canonical spelling and line breaks are preserved; low scores need review.')
+diff --git a/genius_fetcher.py b/genius_fetcher.py
+new file mode 100644
+index 0000000..5a96296
+--- /dev/null
++++ b/genius_fetcher.py
+@@ -0,0 +1,46 @@
++"""Interactive Genius resolution; transcription fallback always needs consent."""
++import re
++
++
++def clean_lyrics(text):
++    lines = text.splitlines()
++    if lines and re.search(r'(?:Contributors.*Lyrics| Lyrics)$', lines[0]):
++        lines.pop(0)
++    text = '\n'.join(lines)
++    text = re.sub(r'\d*Embed\s*$', '', text)
++    return '\n'.join(line.strip() for line in text.splitlines()
++                     if line.strip() and not re.fullmatch(r'\s*\[.*\]\s*', line))
++
++
++def resolve_lyrics(artist, title, token=None, ask=input, output=print):
++    client = None
++    if token:
++        import lyricsgenius
++        client = lyricsgenius.Genius(token, verbose=False, remove_section_headers=True,
++                                     retries=2, timeout=15)
++    else:
++        output('GENIUS_ACCESS_TOKEN is unset; Genius search is unavailable.')
++    while client is not None:
++        try:
++            song = client.search_song(title, artist)
++        except Exception as exc:
++            # Never print request details, which may contain the access token.
++            output(f'Genius search failed ({type(exc).__name__}).')
++            song = None
++        lyrics = clean_lyrics(song.lyrics) if song else ''
++        if lyrics:
++            output(f'Candidate: {song.artist} — {song.title}')
++            output('\n'.join(lyrics.splitlines()[:4]))
++            while True:
++                choice = ask('Use these lyrics? [Y]/[N]/[R]: ').strip().lower()
++                if choice in {'y', 'n', 'r'}:
++                    break
++            if choice == 'y':
++                return lyrics
++        replacement = ask('Alternative song title (blank to stop searching): ').strip()
++        if not replacement:
++            break
++        title = replacement
++    if ask('Generate lyrics entirely with local Whisper instead? [y/N]: ').strip().lower() == 'y':
++        return None
++    raise ValueError('Track skipped: no lyrics approved.')
+diff --git a/main.py b/main.py
+new file mode 100644
+index 0000000..532bded
+--- /dev/null
++++ b/main.py
+@@ -0,0 +1,78 @@
++"""Interactive, local Walkman LRC generation CLI."""
++import argparse
++import os
++from pathlib import Path
++import sys
++
++from aligner import Aligner, write_new
++from comparator import Transcriber, compare_lines, show_diff
++from genius_fetcher import resolve_lyrics
++from scanner import scan_tracks
++
++
++def parser():
++    result = argparse.ArgumentParser(description=__doc__)
++    result.add_argument('directory', type=Path, help='Walkman music directory')
++    result.add_argument('--model', default='small', help='Whisper model name or local model path')
++    result.add_argument('--alignment-model', default='small', help='stable-ts model name or checkpoint')
++    result.add_argument('--device', default='cpu', choices=['cpu', 'cuda'])
++    result.add_argument('--compute-type', default='int8', help='faster-whisper compute type')
++    result.add_argument('--language', default='en', help='Audio language code (default: en)')
++    result.add_argument('--scan-only', action='store_true', help='List pending files without loading models')
++    return result
++
++
++def main(argv=None):
++    args = parser().parse_args(argv)
++    if not args.directory.is_dir():
++        parser().error(f'Not a directory: {args.directory}')
++    transcriber = aligner = None
++    failures = 0
++    try:
++        tracks = list(scan_tracks(args.directory))
++        if args.scan_only:
++            for track in tracks:
++                print(f'{track.path}: {track.artist} — {track.title}')
++            return 0
++        from tqdm import tqdm
++        for track in tqdm(tracks, desc='Tracks'):
++            try:
++                sidecars = {p.name.casefold(): p for p in track.path.parent.iterdir()}
++                if track.lrc_path.name.casefold() in sidecars:
++                    continue
++                existing = sidecars.get(track.lyrics_path.name.casefold())
++                lyrics = existing.read_text(encoding='utf-8-sig') if existing else resolve_lyrics(
++                    track.artist, track.title, os.environ.get('GENIUS_ACCESS_TOKEN'))
++                if lyrics is not None and not lyrics.strip():
++                    raise ValueError('Lyrics file is empty')
++                if transcriber is None:
++                    transcriber = Transcriber(args.model, args.device, args.compute_type)
++                transcript = transcriber.transcribe(track.path, args.language)
++                if not transcript:
++                    raise ValueError('Whisper returned no speech')
++                if lyrics is None:
++                    lyrics = '\n'.join(transcript)
++                show_diff(compare_lines(lyrics, transcript))
++                if input('Proceed with these canonical lines and alignment? [y/N]: ').strip().lower() != 'y':
++                    print(f'Skipped: {track.path}')
++                    continue
++                if aligner is None:
++                    aligner = Aligner(args.alignment_model, args.device)
++                lrc = aligner.align(track.path, lyrics, args.language)
++                if not existing:
++                    write_new(track.lyrics_path, lyrics.rstrip() + '\n')
++                write_new(track.lrc_path, lrc)
++                print(f'Created: {track.lrc_path}')
++            except (EOFError, KeyboardInterrupt):
++                raise
++            except Exception as exc:
++                failures += 1
++                print(f'{track.path}: {type(exc).__name__}: {exc}', file=sys.stderr)
++    except (EOFError, KeyboardInterrupt):
++        print('\nStopped; existing audio and sidecars were preserved.', file=sys.stderr)
++        return 130
++    return 1 if failures else 0
++
++
++if __name__ == '__main__':
++    raise SystemExit(main())
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..ed78c6d
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,6 @@
++faster-whisper>=1.1,<2
++stable-ts>=2.19,<3
++rapidfuzz>=3.9,<4
++lyricsgenius>=3.0,<4
++mutagen>=1.47,<2
++tqdm>=4.66,<5
+diff --git a/scanner.py b/scanner.py
+new file mode 100644
+index 0000000..bd3e7e4
+--- /dev/null
++++ b/scanner.py
+@@ -0,0 +1,51 @@
++"""Discover pending tracks without modifying audio files."""
++from dataclasses import dataclass
++from pathlib import Path
++import re
++
++AUDIO_EXTENSIONS = {'.mp3', '.flac', '.m4a', '.wav'}
++
++
++@dataclass(frozen=True)
++class Track:
++    path: Path
++    artist: str
++    title: str
++
++    @property
++    def lyrics_path(self):
++        return self.path.with_suffix('.txt')
++
++    @property
++    def lrc_path(self):
++        return self.path.with_suffix('.lrc')
++
++
++def read_metadata(path):
++    from mutagen import File, MutagenError
++    path = Path(path)
++    stem = re.sub(r'^\d+[ ._-]+', '', path.stem).replace('_', ' ')
++    artist, separator, title = stem.partition(' - ')
++    if not separator:
++        artist, title = '', stem
++    try:
++        audio = File(path, easy=True)
++        tags = audio.tags if audio is not None else None
++        if tags:
++            artist = (tags.get('artist') or [artist])[0]
++            title = (tags.get('title') or [title])[0]
++    except (OSError, ValueError, MutagenError):
++        pass
++    return Track(path, artist.strip(), title.strip())
++
++
++def scan_tracks(root):
++    root = Path(root)
++    if not root.is_dir():
++        raise ValueError(f'Not a directory: {root}')
++    for path in sorted(root.rglob('*')):
++        if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS:
++            # Compare sidecar names case-insensitively for portable Walkman libraries.
++            names = {p.name.casefold() for p in path.parent.iterdir()}
++            if path.with_suffix('.lrc').name.casefold() not in names:
++                yield read_metadata(path)
+diff --git a/specs/001-walkman-lrc/tasks.md b/specs/001-walkman-lrc/tasks.md
+index 8cbad09..4c2f73e 100644
+--- a/specs/001-walkman-lrc/tasks.md
++++ b/specs/001-walkman-lrc/tasks.md
+@@ -1,8 +1,8 @@
+ # Implementation Tasks
+ 
+-- [ ] Task 1: Module Scanner & Metadata Reader (`scanner.py`)
+-- [ ] Task 2: Module Genius Search & Interactive Resolver (`genius_fetcher.py`)
+-- [ ] Task 3: Module Raw Transcription & Fuzzy Comparator (`comparator.py`)
+-- [ ] Task 4: Module Stable-ts Forced Alignment & LRC Exporter (`aligner.py`)
+-- [ ] Task 5: File Entrypoint CLI tích hợp toàn bộ luồng (`main.py`)
+-- [ ] Task 6: File `requirements.txt` và `README.md` hướng dẫn chạy
+\ No newline at end of file
++- [x] Task 1: Module Scanner & Metadata Reader (`scanner.py`)
++- [x] Task 2: Module Genius Search & Interactive Resolver (`genius_fetcher.py`)
++- [x] Task 3: Module Raw Transcription & Fuzzy Comparator (`comparator.py`)
++- [x] Task 4: Module Stable-ts Forced Alignment & LRC Exporter (`aligner.py`)
++- [x] Task 5: File Entrypoint CLI tích hợp toàn bộ luồng (`main.py`)
++- [x] Task 6: File `requirements.txt` và `README.md` hướng dẫn chạy
+\ No newline at end of file
+diff --git a/tests/test_workflow.py b/tests/test_workflow.py
+new file mode 100644
+index 0000000..43b0824
+--- /dev/null
++++ b/tests/test_workflow.py
+@@ -0,0 +1,76 @@
++import tempfile
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from aligner import Aligner, timestamp, write_new
++from genius_fetcher import resolve_lyrics
++from scanner import scan_tracks
++import main
++
++
++class WorkflowTests(unittest.TestCase):
++    def test_timestamp_carry_and_invalid(self):
++        self.assertEqual(timestamp(59.999), '[01:00.00]')
++        for value in [-1, float('nan'), float('inf')]:
++            with self.assertRaises(ValueError):
++                timestamp(value)
++
++    def test_exclusive_output(self):
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'song.lrc'
++            write_new(path, 'original')
++            with self.assertRaises(FileExistsError):
++                write_new(path, 'replacement')
++            self.assertEqual(path.read_text(), 'original')
++
++    def test_scanner_recursive_skip(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            (root / 'sub').mkdir()
++            (root / 'skip.MP3').touch()
++            (root / 'skip.LRC').touch()
++            pending = root / 'sub' / 'song.flac'
++            pending.touch()
++            with patch('scanner.read_metadata', side_effect=lambda path: path):
++                self.assertEqual(list(scan_tracks(root)), [pending])
++
++    def test_fallback_requires_consent(self):
++        with self.assertRaises(ValueError):
++            resolve_lyrics('', 'song', ask=lambda _: 'n', output=lambda _: None)
++        self.assertIsNone(resolve_lyrics('', 'song', ask=lambda _: 'y', output=lambda _: None))
++
++    def test_alignment_preserves_lines(self):
++        aligner = Aligner.__new__(Aligner)
++        aligner.model = SimpleNamespace(align=lambda *a, **kw: SimpleNamespace(
++            segments=[SimpleNamespace(start=0), SimpleNamespace(start=2.5)]))
++        self.assertEqual(aligner.align('song.wav', 'STR8 UP!\nNext'),
++                         '[00:00.00] STR8 UP!\n[00:02.50] Next\n')
++        with self.assertRaises(ValueError):
++            aligner.align('song.wav', 'only one line')
++
++    def test_cli_existing_txt_bypasses_genius(self):
++        with tempfile.TemporaryDirectory() as directory:
++            root = Path(directory)
++            audio = root / 'song.wav'
++            audio.write_bytes(b'original audio')
++            audio.with_suffix('.txt').write_text('Canonical lyrics')
++            from scanner import Track
++            with patch.object(main, 'scan_tracks', return_value=[Track(audio, '', 'song')]), \
++                 patch.object(main, 'resolve_lyrics', side_effect=AssertionError('Genius called')), \
++                 patch.object(main, 'Transcriber') as transcriber, \
++                 patch.object(main, 'Aligner') as aligner, \
++                 patch.object(main, 'compare_lines', return_value=[]), \
++                 patch('builtins.input', return_value='y'), \
++                 patch.dict('sys.modules', {'tqdm': SimpleNamespace(tqdm=lambda tracks, **kw: tracks)}):
++                transcriber.return_value.transcribe.return_value = ['heard']
++                aligner.return_value.align.return_value = '[00:00.00] Canonical lyrics\n'
++                self.assertEqual(main.main([directory]), 0)
++            self.assertEqual(audio.read_bytes(), b'original audio')
++            self.assertEqual(audio.with_suffix('.txt').read_text(), 'Canonical lyrics')
++            self.assertTrue(audio.with_suffix('.lrc').exists())
++
++
++if __name__ == '__main__':
++    unittest.main()
+-- 
+2.52.0
