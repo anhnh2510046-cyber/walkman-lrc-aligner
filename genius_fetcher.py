@@ -16,8 +16,9 @@ def resolve_lyrics(artist, title, token=None, ask=input, output=print):
     client = None
     if token:
         import lyricsgenius
-        client = lyricsgenius.Genius(token, verbose=False, remove_section_headers=True,
-                                     retries=2, timeout=15)
+        client = lyricsgenius.Genius(token)
+        if hasattr(client, 'verbose'):
+            client.verbose = False
     else:
         output('GENIUS_ACCESS_TOKEN is unset; Genius search is unavailable.')
     while client is not None:

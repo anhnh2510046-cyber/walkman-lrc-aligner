@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 import re
 import unicodedata
+import subprocess
 
 
 def normalize(text):
@@ -23,8 +24,22 @@ class Transcriber:
         self.model = WhisperModel(model, device=device, compute_type=compute_type)
 
     def transcribe(self, path, language=None):
-        segments, _ = self.model.transcribe(str(path), language=language, vad_filter=True)
-        return [s.text.strip() for s in segments if s.text.strip()]
+        try:
+            segments, _ = self.model.transcribe(str(path), language=language, vad_filter=True)
+            return [s.text.strip() for s in segments if s.text.strip()]
+        except TypeError as exc:
+            if 'metadata_errors' not in str(exc) or 'unexpected keyword' not in str(exc):
+                raise
+            import numpy as np
+            decoded = subprocess.run(
+                ['ffmpeg', '-nostdin', '-v', 'error', '-i', str(path),
+                 '-f', 'f32le', '-ac', '1', '-ar', '16000', 'pipe:1'],
+                check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            audio = np.frombuffer(decoded.stdout, dtype='<f4').copy()
+            if not audio.size:
+                raise ValueError('FFmpeg decoded no audio samples') from exc
+            segments, _ = self.model.transcribe(audio, language=language, vad_filter=True)
+            return [s.text.strip() for s in segments if s.text.strip()]
 
 
 def compare_lines(lyrics, transcript):
