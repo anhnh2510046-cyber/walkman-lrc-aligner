@@ -80,8 +80,48 @@ class WorkflowTests(unittest.TestCase):
                 aligner.return_value.align.return_value = '[00:00.00] Canonical lyrics\n'
                 self.assertEqual(main.main([directory]), 0)
             self.assertEqual(audio.read_bytes(), b'original audio')
-            self.assertEqual(audio.with_suffix('.txt').read_text(), 'Canonical lyrics')
+            self.assertFalse(
+                audio.with_suffix('.txt').exists(),
+                'The .txt file must be automatically cleaned up after the .lrc '
+                'file has been successfully created',
+            )
             self.assertTrue(audio.with_suffix('.lrc').exists())
+
+    def test_existing_txt_preserved_on_failure_or_skip(self):
+        from scanner import Track
+        for outcome in ('alignment_failure', 'write_failure', 'skip', 'interrupt'):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                audio = Path(directory) / 'song.wav'
+                audio.write_bytes(b'original audio')
+                txt = audio.with_suffix('.TXT')
+                txt.write_bytes(b'Canonical lyrics')
+                lrc = audio.with_suffix('.lrc')
+                if outcome == 'skip':
+                    lrc.write_bytes(b'existing LRC')
+                with patch.object(main, 'scan_tracks', return_value=[Track(audio, '', 'song')]), \
+                     patch.object(main, 'resolve_lyrics', side_effect=AssertionError('Genius called')), \
+                     patch.object(main, 'Aligner') as aligner, \
+                     patch.object(main, 'write_new', wraps=write_new) as write, \
+                     patch('builtins.print'), \
+                     patch.dict('sys.modules', {'tqdm': SimpleNamespace(tqdm=FakeProgress)}):
+                    aligner.return_value.align.return_value = '[00:00.00] Canonical lyrics\n'
+                    if outcome == 'alignment_failure':
+                        aligner.return_value.align.side_effect = ValueError('Bad alignment')
+                    elif outcome == 'interrupt':
+                        aligner.return_value.align.side_effect = KeyboardInterrupt()
+                    elif outcome == 'write_failure':
+                        write.side_effect = OSError('Write failed')
+                    expected = {'skip': 0, 'interrupt': 130}.get(outcome, 1)
+                    self.assertEqual(main.main([directory]), expected)
+                    if outcome == 'skip':
+                        aligner.assert_not_called()
+                        write.assert_not_called()
+                self.assertEqual(txt.read_bytes(), b'Canonical lyrics')
+                self.assertEqual(audio.read_bytes(), b'original audio')
+                if outcome == 'skip':
+                    self.assertEqual(lrc.read_bytes(), b'existing LRC')
+                else:
+                    self.assertFalse(lrc.exists())
 
 
 if __name__ == '__main__':

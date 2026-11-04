@@ -11,7 +11,9 @@ class GPUAlignmentTests(unittest.TestCase):
         model.align.return_value = SimpleNamespace(segments=[SimpleNamespace(start=1.0, end=2.0, text='Original')])
         load = Mock(return_value=model)
         torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
-        with patch('aligner.audio_duration', return_value=10), patch.dict('sys.modules', {'torch': torch,
+        with patch('aligner.prepare_audio'), \
+             patch('aligner.save_audio_suffix', return_value=(0, 10)), \
+             patch('aligner.audio_duration', return_value=10), patch.dict('sys.modules', {'torch': torch,
                                        'stable_whisper': SimpleNamespace(load_model=load)}):
             aligner = Aligner('small', 'cuda')
             self.assertEqual(aligner.align('audio.wav', 'Original'), '[00:01.00] Original\n')
@@ -20,8 +22,8 @@ class GPUAlignmentTests(unittest.TestCase):
         model.half.assert_not_called()
         model.float.assert_not_called()
         self.assertEqual(model.align.call_args.kwargs,
-                         dict(language='en', original_split=True, fast_mode=True,
-                              verbose=False))
+                         dict(language='en', original_split=True, vad=False,
+                              suppress_silence=True, fast_mode=False, verbose=False))
 
     def test_cpu_keeps_full_precision(self):
         model = Mock()

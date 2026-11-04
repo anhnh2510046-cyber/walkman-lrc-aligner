@@ -221,6 +221,7 @@ def main(argv=None):
                         write_new(track.lrc_path, lrc)
                         print(f'Created: {track.lrc_path}')
 
+                        # A failed write/alignment or a skipped track never reaches cleanup.
                         # Delete TXT only after the LRC write has completed.
                         # Use the actual sidecar path to handle .TXT as well.
                         if track.lrc_path.is_file():
