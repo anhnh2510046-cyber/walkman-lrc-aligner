@@ -21,31 +21,62 @@ class Track:
         return self.path.with_suffix('.lrc')
 
 
-def read_metadata(path):
-    from mutagen import File, MutagenError
+def filename_query(path):
+    """Remove a leading numeric track index, preserving Artist - Title."""
+    stem = Path(path).stem
+    return re.sub(
+        r'^\s*\d+(?:[.)]\s*|\s*-\s*|\s+)',
+        '',
+        stem,
+    ).strip()
+
+
+def read_metadata(path, use_metadata=False):
     path = Path(path)
-    stem = re.sub(r'^\d+[ ._-]+', '', path.stem).replace('_', ' ')
-    artist, separator, title = stem.partition(' - ')
-    if not separator:
-        artist, title = '', stem
+    title = filename_query(path)
+
+    meaningless = not title or bool(re.fullmatch(
+        r'(?:\d+|(?:track|audio|recording|untitled)[ _-]*\d*)',
+        title,
+        re.I,
+    ))
+
+    if not use_metadata and not meaningless:
+        return Track(path, '', title)
+
+    from mutagen import File, MutagenError
+
+    artist = ''
     try:
-        audio = File(path, easy=True)
-        tags = audio.tags if audio is not None else None
-        if tags:
-            artist = (tags.get('artist') or [artist])[0]
-            title = (tags.get('title') or [title])[0]
+        with path.open('rb') as stream:
+            audio = File(stream, easy=True)
+            tags = audio.tags if audio is not None else None
+            if tags:
+                artist = (tags.get('artist') or [''])[0]
+                title = (tags.get('title') or [title])[0]
     except (OSError, ValueError, MutagenError):
         pass
+
     return Track(path, artist.strip(), title.strip())
 
 
-def scan_tracks(root):
+def scan_tracks(root, use_metadata=False):
     root = Path(root)
     if not root.is_dir():
         raise ValueError(f'Not a directory: {root}')
+
     for path in sorted(root.rglob('*')):
-        if path.is_file() and not path.is_symlink() and path.suffix.lower() in AUDIO_EXTENSIONS:
-            # Compare sidecar names case-insensitively for portable Walkman libraries.
-            names = {p.name.casefold() for p in path.parent.iterdir()}
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and path.suffix.lower() in AUDIO_EXTENSIONS
+        ):
+            names = {
+                p.name.casefold()
+                for p in path.parent.iterdir()
+            }
             if path.with_suffix('.lrc').name.casefold() not in names:
-                yield read_metadata(path)
+                if use_metadata:
+                    yield read_metadata(path, use_metadata=True)
+                else:
+                    yield read_metadata(path)
