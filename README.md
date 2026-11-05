@@ -65,15 +65,15 @@ Alignment follows lyric sections rather than submitting all lyrics in one pass:
 3. Convert suffix-relative timestamps back to full-track timestamps.
 4. Advance the cursor to the last line's end minus **0.5 seconds**, retaining overlap for the next stanza.
 
-This limits the alignment context and aims to reduce accumulated drift. Every nonempty approved line is retained in order. A segment-count mismatch, nonfinite/invalid/out-of-range timing, or alignment that does not advance aborts the track without generating an LRC. If the cursor reaches the final second of audio, all remaining lines receive `max(first_vocal_start, duration - 0.5)` as a fallback timestamp and are marked `[?]`; they are not character-weighted estimates.
+This limits the alignment context and aims to reduce accumulated drift. Every nonempty approved line is retained in order. A segment-count mismatch, nonfinite/invalid/out-of-range timing, or alignment that does not advance aborts the track without generating an LRC. If the cursor reaches the final second of audio, all remaining lines receive `max(previous_start, first_vocal_start, duration - 0.5)` as a fallback timestamp and are marked `[?]`; they are not character-weighted estimates.
 
-### Repeated-chorus recovery
+### Sequential timing and Walkman timestamp order
 
-A line start may advance at most **40 seconds** beyond the preceding line start. A longer jump is accepted only when adjacent full-track Silero regions confirm a long silence: the preceding vocal region ends within one second of the previous line end, the next begins at least 40 seconds later, and the candidate falls within its first two seconds. Intervening detected speech blocks that exception. A segment lasting more than 40 seconds is also rejected to prevent a false end time from advancing the stanza cursor to the outro.
+Each stanza is aligned once against the remaining audio suffix using `save_audio_suffix`; the next stanza retains 0.5 seconds of overlap. There is no maximum forward-jump constraint, per-line recovery search, local audio window or pace interpolation.
 
-Rejected candidates are retried one line at a time in a PCM window ending no later than 40 seconds after the previous start. If the local retry is missing or invalid, the line receives a progressively advancing, lyric-length-weighted timing estimate based on the average duration of accepted lines (default pace: 2.8 word-equivalents/second). Nearby VAD onsets can anchor the estimate inside that local budget. Estimated timings are marked `[?]`, excluded from the measured pace, and leave room for outstanding lyrics. Later remote chorus candidates are checked against the recovered local position instead of advancing the cursor to the end of the song.
+Before accepting a line, its full-track start is bounded by the preceding accepted start (`start >= previous_start`). A backward model timestamp is clamped to that start and marked `[?]` for manual review; its end is raised if necessary so `end >= start`. The same bound applies across stanza boundaries. Equal timestamps are allowed and lyric order is preserved.
 
-This recovery preserves canonical lyric order and the existing stanza overlap/review rules. Estimates are not measured word timings; review beat-masked verses by listening. The repeated-chorus regression uses mocked model/VAD results and generated PCM audio; no specific commercial recording is bundled or quality-certified.
+When audio is nearly exhausted, the fallback anchor is the maximum of the last accepted start, the first vocal onset and `duration - 0.5`. This prevents a late timestamp such as `[03:20.72]` from being followed by an earlier fallback. Fallback lines remain marked `[?]`; several lines can share the final timestamp and require manual timing. Large forward matches remain the model's responsibility and are not replaced with estimated timings.
 
 ### Independent review flags and phonetic-verification limits
 
@@ -92,7 +92,7 @@ A separate review pass evaluates the aligned timings and available segment confi
 | Low model confidence | Finite `avg_logprob` below -0.9, when supplied by the segment |
 | Timing cluster | Start gap below 1.5 seconds flags the cluster seed and its immediate neighbors; propagation is one hop |
 | Possible outro mismatch | Last lyric starts more than 12 seconds before audio ends |
-| Recovered false chorus anchor | Locally estimated lines are always marked for review |
+| Backward start correction | Starts clamped to the previous accepted start are marked for review |
 | Exhausted audio | Remaining lines use the final fallback timestamp |
 
 These are review heuristics, not independent phonetic verification against a second recognition result. Missing confidence is not treated as a measured low score. Segment text differences are not compared by this pass: output uses the approved lyric text. `comparator.py` provides ordered text-window comparisons with RapidFuzz, but the current CLI does not invoke them. Dense vocals, long outros, and languages without space-delimited words can require additional manual judgment. Listen to flagged lines and adjust their timestamps/text before copying the LRC to a player.
@@ -251,7 +251,7 @@ Exit status: `0` for completion and normal skip paths, `1` when a track exceptio
 
 ## 5. Quality assurance
 
-**Latest validation: 68/68 tests passed (all 58 previous tests plus 10 hardware-selection regressions)**, with no failures or skips, on Python 3.12 in the prepared CPU environment. Run the full unit and workflow integration regression suite with:
+**Latest validation: 67/67 tests passed (59 retained tests plus 8 sequential-timing regressions)**, with no failures or skips, on Python 3.12 in the prepared CPU environment. Run the full unit and workflow integration regression suite with:
 
 ```sh
 python -m unittest discover -s tests -v
@@ -268,9 +268,9 @@ python -m unittest discover -s tests -v
 | `test_walkman_encoding.py` | 3 | Unicode normalization, BOM bytes and exclusive output creation |
 | `test_workflow.py` | 6 | Recursive scan, consent, timestamp formatting, LRC output and safe TXT cleanup |
 | `test_practical_features.py` | 10 | Single-file scans, invalid paths, accent export, CPU VAD, onset bounds and no-vocal failure |
-| `test_refrain_recovery.py` | 9 | Repeated chorus rejection, bounded retry, VAD silence exceptions, paced fallback and PCM window bounds |
+| `test_sequential_alignment.py` | 8 | Nondecreasing starts within/across stanzas, safe exhausted-audio anchors, equal starts, rounding and suffix-only alignment |
 | `test_device_selection.py` | 10 | One-time GPU/CPU prompt, unattended defaults, session-wide ASR/aligner device propagation, Demucs commands/stem paths and failure fallback |
-| **Total** | **68** | **Unit and workflow integration regressions** |
+| **Total** | **67** | **Unit and workflow integration regressions** |
 
 Model/API doubles isolate most external operations. The duration test reads an actual generated PCM WAV using Python's `wave` module; it is not an ffprobe integration test. New coverage checks the real bundled Silero model on generated silence on CPU and uses mocked detections to verify vocal-onset cropping and stanza overlap. Existing timing/GPU fixtures mock the onset helper to isolate their original assertions. Passing these tests does not establish live Genius access, real singing/alignment quality, CUDA execution, Demucs separation quality, or physical NW-S644 rendering. Those checks require the relevant dependencies, weights, credentials, hardware and representative audio.
 
@@ -282,8 +282,8 @@ Model/API doubles isolate most external operations. The duration test reads an a
 | `scanner.py` | File/folder track discovery, filename queries and optional metadata |
 | `genius_fetcher.py` | Genius approval flow, URL host checks and stanza-preserving text cleanup |
 | `comparator.py` | Fallback ASR, decoder compatibility and separately available text-comparison helpers |
-| `aligner.py` | Optional vocal separation, CPU Silero detection, stanza alignment, bounded chorus recovery, timing validation, review flags and BOM writing |
+| `aligner.py` | Optional vocal separation, CPU Silero detection, sequential stanza alignment, nondecreasing timestamp validation, review flags and BOM writing |
 
 Recent implementation history: `a6c15b9` fixed Genius/PyAV compatibility; `f355429` introduced the stanza engine and review flags; `5c433eb` updated stanza, GPU-option and TXT-cleanup regressions; `40426da` updated ignore rules. This README describes the resulting implementation rather than earlier whole-song alignment/retry behavior.
 
-Commit `7870287` added file-path inputs, the Silero onset guard and optional accent stripping. The repeated-chorus recovery adds a 40-second forward-jump limit, bounded local retries and paced estimates marked `[?]`, with nine regression tests. Hardware selection now propagates a session-wide CPU/CUDA choice to Demucs, ASR and alignment, with a refinement profile for CUDA. The text-comparison heuristics in `comparator.py` remain unchanged.
+Commit `7870287` added file-path inputs, the Silero onset guard and optional accent stripping. The experimental anti-jump/recovery logic has been removed; sequential stanza alignment now enforces nondecreasing timestamps, including exhausted-audio fallbacks. Its obsolete recovery tests have been replaced with eight sequential-timing regressions. Hardware selection now propagates a session-wide CPU/CUDA choice to Demucs, ASR and alignment, with a refinement profile for CUDA. The text-comparison heuristics in `comparator.py` remain unchanged.

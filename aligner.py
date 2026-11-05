@@ -11,8 +11,6 @@ from functools import lru_cache
 
 from genius_fetcher import normalize_lyrics_text
 
-MAX_FORWARD_JUMP = 40.0
-
 
 def write_new(path, text):
     """Create a UTF-8 BOM sidecar without overwriting an existing file."""
@@ -139,8 +137,8 @@ def vocal_detector():
     return load_silero_vad().cpu().eval()
 
 
-def detect_vocals(path):
-    """Read prepared PCM and return Silero sample intervals and sample count."""
+def first_vocal_start(path):
+    """Return the first detected speech sample in prepared 16 kHz mono PCM."""
     import torch
     from silero_vad import get_speech_timestamps
 
@@ -159,108 +157,12 @@ def detect_vocals(path):
             samples, vocal_detector(), sampling_rate=16000,
             return_seconds=False, speech_pad_ms=0,
         )
-    return segments, len(samples)
-
-
-def first_vocal_start(path):
-    """Return the first detected speech sample in prepared 16 kHz mono PCM."""
-    segments, sample_count = detect_vocals(path)
     if not segments:
         raise ValueError('Silero VAD detected no vocals; no LRC generated')
     start = float(segments[0]['start']) / 16000
-    if not math.isfinite(start) or not 0 <= start < sample_count / 16000:
+    if not math.isfinite(start) or not 0 <= start < len(samples) / 16000:
         raise ValueError('Silero VAD returned an invalid vocal start')
     return start
-
-
-def vocal_intervals(path):
-    """Validated full-track speech intervals, loaded only for suspect matches."""
-    segments, sample_count = detect_vocals(path)
-    intervals = []
-    for segment in segments:
-        start, end = float(segment['start']) / 16000, float(segment['end']) / 16000
-        if not (math.isfinite(start) and math.isfinite(end)
-                and 0 <= start < end <= sample_count / 16000):
-            raise ValueError('Silero VAD returned an invalid vocal interval')
-        if intervals and start < intervals[-1][1]:
-            raise ValueError('Silero VAD returned overlapping vocal intervals')
-        intervals.append((start, end))
-    return intervals
-
-
-def confirmed_silence(previous_end, start, intervals):
-    """Allow a long jump only between adjacent VAD regions at both anchors."""
-    return any(
-        abs(left_end - previous_end) <= 1.0
-        and right_start <= start <= min(right_end, right_start + 2.0)
-        and right_start - left_end >= MAX_FORWARD_JUMP
-        for (_, left_end), (right_start, right_end)
-        in zip(intervals, intervals[1:])
-    )
-
-
-def lyric_weight(line):
-    # Also provide a useful pace for lyrics without whitespace word boundaries.
-    return max(1, len(line.split()), len(line.replace(' ', '')) / 5)
-
-
-def save_audio_window(source, destination, start, end):
-    """Decode no extra audio: copy just the bounded PCM search window."""
-    with wave.open(str(source), 'rb') as reader:
-        rate = reader.getframerate()
-        first = max(0, math.ceil(start * rate))
-        last = min(reader.getnframes(), math.floor(end * rate))
-        if last <= first:
-            raise ValueError('No audio left in local alignment window')
-        reader.setpos(first)
-        with wave.open(str(destination), 'wb') as writer:
-            writer.setparams(reader.getparams())
-            frames_left = last - first
-            while frames_left:
-                count = min(frames_left, 65536)
-                writer.writeframesraw(reader.readframes(count))
-                frames_left -= count
-    return first / rate, (last - first) / rate
-
-
-def recover_local_line(model, source, window, line, language, previous_start,
-                       previous_end, duration, intervals, pace, lines_left):
-    """Retry a rejected chorus anchor locally, otherwise estimate and mark it."""
-    lower = max(0.0, previous_end - 0.5, previous_start)
-    upper = min(duration, previous_start + MAX_FORWARD_JUMP)
-    # Leave room for every outstanding lyric, even if the model keeps failing.
-    latest = duration - 0.02 * max(1, lines_left)
-    if lower < upper and lower < latest:
-        offset, length = save_audio_window(source, window, lower, upper)
-        result = model.align(
-            str(window), line, language=language, original_split=True,
-            vad=False, suppress_silence=True, fast_mode=False, verbose=False,
-        )
-        segments = list(result.segments) if result is not None else []
-        if len(segments) == 1:
-            segment = segments[0]
-            try:
-                start, end = float(segment.start), float(segment.end)
-            except (AttributeError, TypeError, ValueError):
-                start = end = float('nan')
-            if (math.isfinite(start) and math.isfinite(end)
-                    and 0 <= start < end <= length
-                    and offset + start > previous_start
-                    and offset + end <= latest):
-                return offset + start, offset + end, False, segment_logprob(segment)
-
-    # Linear pace estimates are not acoustic measurements. Snap to nearby VAD
-    # only inside the local search budget, never to a distant repeated chorus.
-    start = max(previous_end, previous_start + 0.02)
-    expected = min(12.0, max(0.8, lyric_weight(line) * pace))
-    nearby = [a for a, b in intervals
-              if start <= a <= min(start + expected, upper) and b > a]
-    if nearby:
-        start = nearby[0]
-    start = min(start, latest)
-    available = max(0.02, (duration - start) / max(1, lines_left))
-    end = min(duration, start + min(expected, available))
-    return start, end, True, None
 
 
 def save_audio_suffix(source, destination, time_cursor):
@@ -411,10 +313,6 @@ class Aligner:
 
         aligned = []
         time_cursor = 0.0
-        intervals = None
-        recovering = False
-        trusted_seconds = trusted_weight = 0.0
-        total_lines = sum(map(len, stanzas))
 
         with tempfile.TemporaryDirectory(
             prefix='walkman-stanzas-'
@@ -424,10 +322,11 @@ class Aligner:
             duration = audio_duration(source)
             vocal_start = first_vocal_start(source)
             time_cursor = vocal_start
+            previous_start = vocal_start
 
             for number, lines in enumerate(stanzas, start=1):
                 if time_cursor >= duration - 1.0:
-                    anchor = max(vocal_start, duration - 0.5)
+                    anchor = max(previous_start, vocal_start, duration - 0.5)
 
                     warnings.warn(
                         'Audio nearly exhausted; remaining lyrics use '
@@ -499,44 +398,15 @@ class Aligner:
                     start = min(start, remaining)
                     end = min(end, remaining)
 
-                    absolute_start, absolute_end = offset + start, offset + end
-                    if stanza_times:
-                        previous_start, previous_end = stanza_times[-1]
-                    elif aligned:
-                        previous_start, previous_end = aligned[-1][1:3]
-                    else:
-                        previous_start = previous_end = vocal_start
-
-                    distant = absolute_start - previous_start > MAX_FORWARD_JUMP
-                    stretched = absolute_end - absolute_start > MAX_FORWARD_JUMP
-                    regressed = recovering and absolute_start <= previous_start
-                    forced_review = False
-                    confidence = segment_logprob(segment)
-                    if distant or stretched or regressed:
-                        if intervals is None:
-                            intervals = vocal_intervals(source)
-                        if stretched or regressed or not confirmed_silence(
-                            previous_end, absolute_start, intervals
-                        ):
-                            recovering = True
-                            pace = (trusted_seconds / trusted_weight
-                                    if trusted_weight else 1 / 2.8)
-                            absolute_start, absolute_end, forced_review, confidence = recover_local_line(
-                                self.model, source, root / 'local-line.wav',
-                                lines[i], language, previous_start, previous_end,
-                                duration, intervals, pace,
-                                total_lines - len(aligned) - i,
-                            )
-
-                    if not forced_review and absolute_end > absolute_start:
-                        trusted_seconds += absolute_end - absolute_start
-                        trusted_weight += lyric_weight(lines[i])
-
-                    stanza_times.append(
-                        (absolute_start, absolute_end)
+                    absolute_start = offset + start
+                    corrected_start = max(previous_start, absolute_start)
+                    corrected_end = max(corrected_start, offset + end)
+                    stanza_times.append((corrected_start, corrected_end))
+                    stanza_reviews.append(corrected_start != absolute_start)
+                    previous_start = corrected_start
+                    stanza_confidences.append(
+                        segment_logprob(segment)
                     )
-                    stanza_confidences.append(confidence)
-                    stanza_reviews.append(forced_review)
 
                 if max(end for _, end in stanza_times) <= offset:
                     raise ValueError(
