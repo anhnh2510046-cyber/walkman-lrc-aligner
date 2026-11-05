@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import silero_vad
+
 from aligner import Aligner, first_vocal_start, vocal_detector
 from main import main, parser, strip_vietnamese_accents
 from scanner import AUDIO_EXTENSIONS, scan_tracks
@@ -63,7 +65,7 @@ class AccentTests(unittest.TestCase):
                     'sys.modules', {'tqdm': SimpleNamespace(tqdm=FakeProgress)}
                 ), patch('builtins.print'):
                     model.return_value.align.return_value = '[00:03.00] [?] Tiếng Việt bão táp\n'
-                    argv = [str(audio)] + (['--strip-vietnamese-accents'] if enabled else [])
+                    argv = [str(audio), '--device', 'cpu'] + (['--strip-vietnamese-accents'] if enabled else [])
                     self.assertEqual(main(argv), 0)
                 self.assertEqual(model.return_value.align.call_args.args[1], 'Tiếng Việt bão táp')
                 data = audio.with_suffix('.lrc').read_bytes()
@@ -91,7 +93,7 @@ class VocalOnsetTests(unittest.TestCase):
             self.assertEqual(len(samples), 160000)
             self.assertEqual(kwargs, dict(sampling_rate=16000, return_seconds=False, speech_pad_ms=0))
             return [{'start': 48000, 'end': 64000}]
-        with patch('silero_vad.get_speech_timestamps', side_effect=detect), patch('aligner.vocal_detector'):
+        with patch.object(silero_vad, 'get_speech_timestamps', side_effect=detect), patch('aligner.vocal_detector'):
             self.assertEqual(first_vocal_start(self.audio), 3.0)
 
     def test_real_cpu_model_rejects_silence(self):
@@ -101,8 +103,8 @@ class VocalOnsetTests(unittest.TestCase):
 
     def test_invalid_detection_is_rejected(self):
         for start in (-1, 160001, float('nan')):
-            with self.subTest(start=start), patch('aligner.vocal_detector'), patch(
-                'silero_vad.get_speech_timestamps', return_value=[{'start': start}]
+            with self.subTest(start=start), patch('aligner.vocal_detector'), patch.object(
+                silero_vad, 'get_speech_timestamps', return_value=[{'start': start}]
             ), self.assertRaisesRegex(ValueError, 'invalid vocal start'):
                 first_vocal_start(self.audio)
 

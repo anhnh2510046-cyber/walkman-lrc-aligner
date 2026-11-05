@@ -274,6 +274,14 @@ python -m unittest discover -s tests -v
 
 Model/API doubles isolate most external operations. The duration test reads an actual generated PCM WAV using Python's `wave` module; it is not an ffprobe integration test. New coverage checks the real bundled Silero model on generated silence on CPU and uses mocked detections to verify vocal-onset cropping and stanza overlap. Existing timing/GPU fixtures mock the onset helper to isolate their original assertions. Passing these tests does not establish live Genius access, real singing/alignment quality, CUDA execution, Demucs separation quality, or physical NW-S644 rendering. Those checks require the relevant dependencies, weights, credentials, hardware and representative audio.
 
+### Test isolation and Python versions
+
+Lyric-selection and accent-export tests pass `--device cpu` explicitly so the hardware selector cannot consume mocked lyric-approval answers on GPU-equipped interactive hosts. Hardware prompt behavior remains covered separately by `test_device_selection.py`.
+
+`test_practical_features.py` imports `silero_vad` once at module scope and patches `get_speech_timestamps` with `patch.object(silero_vad, ...)`. This keeps the imported module available before temporary `sys.modules` mocks run and avoids resolving the Silero import through string-based patch targets. The real CPU Silero silence check remains enabled.
+
+These fixes address the reported mock-input exhaustion and PyTorch reinitialization failures. The full 67-test suite was verified on **Python 3.12.14**; Python 3.14 is unavailable in the validation environment, so compatibility with Python 3.14 has not been verified. The documented supported runtime remains Python 3.10–3.12.
+
 ### Implementation map and recent changes
 
 | Module | Responsibility |

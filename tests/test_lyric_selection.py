@@ -33,7 +33,7 @@ class FallbackWorkflowTests(unittest.TestCase):
                  patch('builtins.input', side_effect=lambda _: next(answers)):
                 transcriber.return_value.transcribe.return_value = ['Generated']
                 aligner.return_value.align.return_value = '[00:00.00] Aligned\n'
-                self.assertEqual(main.main([directory]), 0)
+                self.assertEqual(main.main([directory, '--device', 'cpu']), 0)
                 resolve.assert_called_once_with('', 'Artist - Song', unittest.mock.ANY)
                 if asr_expected:
                     transcriber.assert_called_once()
