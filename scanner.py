@@ -62,10 +62,16 @@ def read_metadata(path, use_metadata=False):
 
 def scan_tracks(root, use_metadata=False):
     root = Path(root)
-    if not root.is_dir():
-        raise ValueError(f'Not a directory: {root}')
+    if root.is_file():
+        if root.suffix.lower() not in AUDIO_EXTENSIONS:
+            raise ValueError(f'Unsupported audio file: {root}')
+        paths = [root]
+    elif root.is_dir():
+        paths = sorted(root.rglob('*'))
+    else:
+        raise ValueError(f'Not an audio file or directory: {root}')
 
-    for path in sorted(root.rglob('*')):
+    for path in paths:
         if (
             path.is_file()
             and not path.is_symlink()

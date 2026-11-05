@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import warnings
 import wave
+from functools import lru_cache
 
 from genius_fetcher import normalize_lyrics_text
 
@@ -124,6 +125,41 @@ def audio_duration(path):
         raise ValueError('Decoded audio has no samples')
 
     return duration
+
+
+@lru_cache(maxsize=1)
+def vocal_detector():
+    """Reuse the packaged Silero CPU model across tracks."""
+    from silero_vad import load_silero_vad
+    return load_silero_vad().cpu().eval()
+
+
+def first_vocal_start(path):
+    """Return the first detected speech sample in prepared 16 kHz mono PCM."""
+    import torch
+    from silero_vad import get_speech_timestamps
+
+    with wave.open(str(path), 'rb') as reader:
+        audio_format = (
+            reader.getframerate(), reader.getnchannels(), reader.getsampwidth()
+        )
+        if audio_format != (16000, 1, 2):
+            raise ValueError('VAD requires 16 kHz mono 16-bit PCM')
+        samples = torch.frombuffer(
+            bytearray(reader.readframes(reader.getnframes())), dtype=torch.int16
+        ).float() / 32768.0
+
+    with torch.inference_mode():
+        segments = get_speech_timestamps(
+            samples, vocal_detector(), sampling_rate=16000,
+            return_seconds=False, speech_pad_ms=0,
+        )
+    if not segments:
+        raise ValueError('Silero VAD detected no vocals; no LRC generated')
+    start = float(segments[0]['start']) / 16000
+    if not math.isfinite(start) or not 0 <= start < len(samples) / 16000:
+        raise ValueError('Silero VAD returned an invalid vocal start')
+    return start
 
 
 def save_audio_suffix(source, destination, time_cursor):
@@ -281,10 +317,12 @@ class Aligner:
             root = Path(directory)
             source = prepare_audio(path, root)
             duration = audio_duration(source)
+            vocal_start = first_vocal_start(source)
+            time_cursor = vocal_start
 
             for number, lines in enumerate(stanzas, start=1):
                 if time_cursor >= duration - 1.0:
-                    anchor = max(0.0, duration - 0.5)
+                    anchor = max(vocal_start, duration - 0.5)
 
                     warnings.warn(
                         'Audio nearly exhausted; remaining lyrics use '

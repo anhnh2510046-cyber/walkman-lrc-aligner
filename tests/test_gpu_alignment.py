@@ -11,7 +11,8 @@ class GPUAlignmentTests(unittest.TestCase):
         model.align.return_value = SimpleNamespace(segments=[SimpleNamespace(start=1.0, end=2.0, text='Original')])
         load = Mock(return_value=model)
         torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
-        with patch('aligner.prepare_audio'), \
+        with patch('aligner.first_vocal_start', return_value=0.0), \
+             patch('aligner.prepare_audio'), \
              patch('aligner.save_audio_suffix', return_value=(0, 10)), \
              patch('aligner.audio_duration', return_value=10), patch.dict('sys.modules', {'torch': torch,
                                        'stable_whisper': SimpleNamespace(load_model=load)}):

@@ -3,17 +3,19 @@ import argparse
 import os
 from pathlib import Path
 import sys
+import unicodedata
 
 from aligner import Aligner, write_new
 from comparator import Transcriber
 from genius_fetcher import resolve_lyrics, normalize_lyrics_text
-from scanner import scan_tracks
+from scanner import AUDIO_EXTENSIONS, scan_tracks
 
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument(
-        'directory', type=Path, help='Walkman music directory'
+        'directory', type=Path, metavar='location',
+        help='Audio file or Walkman music directory'
     )
     result.add_argument(
         '--model',
@@ -49,7 +51,19 @@ def parser():
         action='store_true',
         help='List pending files without loading models',
     )
+    result.add_argument(
+        '--strip-vietnamese-accents', action='store_true',
+        help='Remove combining accents and map đ/Đ to d/D in LRC output',
+    )
     return result
+
+
+def strip_vietnamese_accents(text):
+    """Apply Unikey-style accent removal without changing LRC punctuation."""
+    text = unicodedata.normalize('NFD', text)
+    return ''.join(
+        char for char in text if unicodedata.category(char) != 'Mn'
+    ).replace('đ', 'd').replace('Đ', 'D')
 
 
 def enter_manual_lyrics(ask=input, output=print):
@@ -79,8 +93,11 @@ def enter_manual_lyrics(ask=input, output=print):
 
 def main(argv=None):
     args = parser().parse_args(argv)
-    if not args.directory.is_dir():
-        parser().error(f'Not a directory: {args.directory}')
+    if not (args.directory.is_dir() or (
+        args.directory.is_file()
+        and args.directory.suffix.lower() in AUDIO_EXTENSIONS
+    )):
+        parser().error(f'Not a supported audio file or directory: {args.directory}')
 
     compute_type = args.compute_type or (
         'float16' if args.device == 'cuda' else 'int8'
@@ -218,6 +235,8 @@ def main(argv=None):
                             )
 
                         # Exclusive creation: existing LRC files are preserved.
+                        if args.strip_vietnamese_accents:
+                            lrc = strip_vietnamese_accents(lrc)
                         write_new(track.lrc_path, lrc)
                         print(f'Created: {track.lrc_path}')
 

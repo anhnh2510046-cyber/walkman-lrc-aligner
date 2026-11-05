@@ -5,18 +5,18 @@ Interactive Python CLI for generating synchronized `.lrc` lyrics beside local au
 ## 1. Workflow architecture
 
 ```text
-Music folder → recursive scan → existing TXT or approved Genius lyrics
+Audio file or music folder → scan → existing TXT or approved Genius lyrics
                                     ↓ no approved lyrics + explicit consent
                               local Whisper ASR → user approval / manual entry
                                     ↓
 Approved lyrics → optional Demucs vocals → FFmpeg PCM decoding
-                → stanza-guided stable-ts alignment → review flags → BOM LRC
+                → Silero vocal onset → stanza-guided stable-ts alignment → review flags → BOM LRC
                 → verify LRC exists → remove TXT sidecar
 ```
 
 ### Track discovery and lyric selection
 
-- Recursively scan MP3, FLAC, M4A and WAV files. Skip symbolic-link audio files and tracks with an existing LRC sidecar; extension/sidecar matching is case-insensitive.
+- Accept a single MP3, FLAC, M4A or WAV file, or recursively scan a music folder. Skip symbolic-link audio files and tracks with an existing LRC sidecar; extension/sidecar matching is case-insensitive.
 - Use the full filename stem as the search query, preserving `Artist - Title` and removing a leading numeric track index such as `01.` or `02 -`. Read metadata for generic/numeric names, or explicitly with `--use-metadata`; parsing failures retain the filename fallback.
 - Read an existing UTF-8 TXT sidecar (with or without BOM) directly, bypassing Genius and ASR.
 - Otherwise, search Genius, preview four nonempty lyric lines, and require approval. Rejecting a candidate allows another title or a direct `genius.com` URL. Section headings become blank stanza separators; Genius header/footer metadata is removed.
@@ -49,16 +49,20 @@ fast_mode=False
 verbose=False
 ```
 
-Silence suppression helps adjust timing around silence. **Silero VAD is not enabled in the current pipeline**: alignment uses `vad=False`, and ASR uses `vad_filter=False`. There is no automatic retry with `vad=True` or CLI switch to enable it.
+Before stanza alignment, the bundled `silero-vad` CPU model runs `get_speech_timestamps` on the prepared 16 kHz mono PCM audio, with no speech padding. The first detected vocal start becomes the lower bound: the first stanza receives only the audio from that onset onward, and its timestamps are translated back to the full track. This prevents alignment from placing the first lyric in the preceding intro/silence. The remaining stanza timing and review heuristics are unchanged.
+
+If no vocals are detected, the track fails without producing an LRC and existing TXT lyrics are preserved. Model errors also fail the track rather than silently dropping the onset guard. Silero's packaged model is reused across tracks and runs on CPU even with `--device cuda`. A detected onset at audio start can legitimately produce `00:00`; VAD is a speech detector and can misclassify singing or instruments, so this guard depends on its detected onset.
+
+Stable-ts retains `vad=False` and `suppress_silence=True` for its existing per-stanza timing behavior; Silero detection is a separate preprocessing step. ASR retains `vad_filter=False`. There is no VAD CLI toggle or automatic `vad=True` retry.
 
 Alignment follows lyric sections rather than submitting all lyrics in one pass:
 
 1. Split normalized lyrics at blank lines; if none exist, group consecutive lines in batches of nine. Musical sections follow supplied stanza breaks rather than automatic section detection.
-2. Align each stanza against the remaining audio suffix, preserving its lyric line boundaries.
+2. Start the first audio suffix at the Silero-detected vocal onset, then align each stanza against the remaining suffix, preserving its lyric line boundaries.
 3. Convert suffix-relative timestamps back to full-track timestamps.
 4. Advance the cursor to the last line's end minus **0.5 seconds**, retaining overlap for the next stanza.
 
-This limits the alignment context and aims to reduce accumulated drift. Every nonempty approved line is retained in order. A segment-count mismatch, nonfinite/invalid/out-of-range timing, or alignment that does not advance aborts the track without generating an LRC. If the cursor reaches the final second of audio, all remaining lines receive `max(0, duration - 0.5)` as a fallback timestamp and are marked `[?]`; they are not character-weighted estimates.
+This limits the alignment context and aims to reduce accumulated drift. Every nonempty approved line is retained in order. A segment-count mismatch, nonfinite/invalid/out-of-range timing, or alignment that does not advance aborts the track without generating an LRC. If the cursor reaches the final second of audio, all remaining lines receive `max(first_vocal_start, duration - 0.5)` as a fallback timestamp and are marked `[?]`; they are not character-weighted estimates.
 
 ### Independent review flags and phonetic-verification limits
 
@@ -89,8 +93,168 @@ New TXT and LRC sidecars use **UTF-8 with BOM (`utf-8-sig`)**, LF newlines, and 
 
 The BOM supports encoding detection for Vietnamese, Japanese and English text on classic players. It cannot add glyphs absent from the NW-S644's installed firmware/font, guarantee sharp rendering, or universally prevent `□` placeholders. The automated suite verifies encoding bytes and Unicode preservation; physical NW-S644 display compatibility has not been verified. Check a representative multilingual LRC on your device before processing a full library.
 
+For Vietnamese font compatibility, enable `--strip-vietnamese-accents`. Immediately before LRC writing, the application decomposes text with `unicodedata.normalize('NFD', text)`, removes combining marks (`Mn`), and maps `đ`/`Đ` to `d`/`D`. For example, `Tiếng Việt bão táp` becomes `Tieng Viet bao tap`. Timestamps, `[?]`, punctuation and line breaks are preserved; alignment uses the original accented lyrics. This uses Python's standard library, with no Unikey executable or extra transliteration dependency.
+
+The flag defaults to off. The requested NFD/Mn algorithm removes combining marks in other languages too (including Japanese voiced marks), so use it for Vietnamese material rather than mixed-language lyrics requiring those marks. It improves Vietnamese character compatibility but cannot guarantee every symbol renders on every firmware.
+
 Keep matching audio/LRC basenames, for example:
 
 ```text
 Music/
   Artist - Song.mp3
+  Artist - Song.lrc
+```
+
+### Automatic safe TXT cleanup
+
+- LRC output uses exclusive creation, preventing an existing sidecar from being overwritten.
+- After the LRC write completes and `lrc_path.is_file()` confirms it exists, the associated TXT is deleted. This includes **pre-existing user-supplied TXT** and case variants such as `.TXT`, as well as newly generated intermediate TXT.
+- Alignment failure, LRC write failure, interruption before cleanup, or Skip preserves an existing TXT for the next run. Existing LRC files are skipped.
+- Existing TXT contents are not rewritten before cleanup. Keep a separate backup if you want to retain your source lyrics after successful conversion.
+- Existence checking is not an atomic transaction or a durability check. An interrupted/failed write may leave a partial LRC; inspect and remove an incomplete output before rerunning, since existing LRC files are skipped.
+
+Avoid concurrent writers and multiple audio files with the same basename in one folder, because they share sidecar paths. Source audio is never overwritten.
+
+## 3. Installation
+
+### Prerequisites and virtual environment
+
+Use **Python 3.10–3.12** and install FFmpeg, including `ffprobe`, on PATH. Debian/Ubuntu:
+
+```sh
+sudo apt update
+sudo apt install ffmpeg
+```
+
+On Windows, install an FFmpeg distribution and add its `bin` directory to PATH. Confirm availability:
+
+```sh
+ffmpeg -version
+ffprobe -version
+```
+
+Create and activate a virtual environment from the repository root:
+
+| Platform | Create | Activate |
+| --- | --- | --- |
+| Windows PowerShell | `py -3.12 -m venv .venv` | `.\.venv\Scripts\Activate.ps1` |
+| Windows Command Prompt | `py -3.12 -m venv .venv` | `.venv\Scripts\activate.bat` |
+| Linux/macOS | `python3 -m venv .venv` | `. .venv/bin/activate` |
+
+### PyTorch: CPU or CUDA
+
+Install matching PyTorch/torchaudio packages **before** the remaining dependencies. A CPU configuration validated during cloud onboarding is:
+
+```sh
+python -m pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -r requirements.txt
+```
+
+For an NVIDIA GPU, select a wheel build supported by your driver using the [official PyTorch installation selector](https://pytorch.org/get-started/locally/). For example, a matching CUDA 12.8 pair is:
+
+```sh
+python -m pip install torch==2.8.0 torchaudio==2.8.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements.txt
+python -c "import torch; print(torch.__version__); print('CUDA available:', torch.cuda.is_available())"
+```
+
+CUDA-enabled PyTorch is required for stable-ts GPU alignment. Faster-whisper additionally uses CTranslate2 and needs compatible NVIDIA CUDA/cuDNN libraries; consult its [GPU requirements](https://github.com/SYSTRAN/faster-whisper#gpu) for your installed version. `torch.cuda.is_available()` alone does not validate CTranslate2. The aligner preserves the model's default dtype rather than forcing `.half()`/`.float()` conversions. Requesting CUDA without available CUDA-enabled PyTorch/GPU raises a clear error.
+
+Optionally install vocal separation:
+
+```sh
+python -m pip install demucs
+```
+
+Demucs may download its own weights. Installing it on PATH automatically enables separation during alignment; there is no Demucs CLI toggle in this application.
+
+### Model caches and Genius access
+
+Set `HF_HOME` **before starting Python** to place Hugging Face downloads on a secondary drive rather than filling `C:`. Windows PowerShell example:
+
+```powershell
+$env:HF_HOME = 'D:\AI_Cache\huggingface'
+```
+
+For future PowerShell sessions, persist the non-secret path with:
+
+```powershell
+[Environment]::SetEnvironmentVariable('HF_HOME', 'D:\AI_Cache\huggingface', 'User')
+```
+
+Linux/macOS example:
+
+```sh
+export HF_HOME=/path/to/secondary-drive/AI_Cache/huggingface
+```
+
+`HF_HOME` controls the Hugging Face cache used by faster-whisper. It does not relocate every backend's cache: stable-ts loads OpenAI Whisper models, and Demucs has separate caching. Use `--alignment-model` with a local Whisper checkpoint when needed; `--model` accepts a faster-whisper local model directory. The engines use different model formats. Download required weights before offline use.
+
+For Genius search/direct URL lookup, create a Genius API client and set `GENIUS_ACCESS_TOKEN` securely in your shell or environment settings. Never commit tokens. Both API access and lyrics-page access must work. Without the token, existing TXT lyrics remain usable and the CLI offers explicitly consented local Whisper generation.
+
+## 4. CLI reference
+
+Run commands from the repository root with the virtual environment active:
+
+```sh
+python main.py "E:\Music" --scan-only
+python main.py "E:\Music" --device cuda --language vi
+python main.py "E:\Music\song.mp3" --language vi --strip-vietnamese-accents
+python main.py "E:\Music\Japanese Album" --device cpu --language ja
+python main.py /path/to/Music --language en --use-metadata
+python main.py --help
+```
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `location` (required positional) | — | Supported audio **file** or music **folder** to scan recursively |
+| `--device` | `cpu` | `cpu` or `cuda` for ASR and alignment; Demucs remains on CPU |
+| `--language` | `en` | Audio language code, for example `en`, `vi`, or `ja` |
+| `--model` | `small` | Faster-whisper ASR model name or local model directory; used only on fallback |
+| `--alignment-model` | `small` | Stable-ts/OpenAI Whisper model name or local checkpoint |
+| `--compute-type` | `int8` on CPU; `float16` on CUDA | Faster-whisper compute type; does not set stable-ts precision |
+| `--use-metadata` | Disabled | Prefer embedded artist/title metadata over descriptive filenames |
+| `--strip-vietnamese-accents` | Disabled | Strip combining accents and map đ/Đ to d/D in exported LRC text only |
+| `--scan-only` | Disabled | List pending tracks without loading models or writing sidecars |
+| `-h`, `--help` | — | Show CLI help |
+
+Single-song paths use the same sidecar skipping, metadata, alignment and cleanup logic as folder scans. Unsupported extensions or missing paths produce an argument error. Quote paths containing spaces. Existing LRC sidecars are skipped for both input forms.
+
+Exit status: `0` for completion and normal skip paths, `1` when a track exception is recorded (including declining the final Whisper fallback with no approved lyrics), `130` for interruption/EOF. Argument validation errors use argparse's exit status `2`.
+
+## 5. Quality assurance
+
+**Latest validation: 49/49 tests passed (all 39 existing tests plus 10 new tests)**, with no failures or skips, on Python 3.12 in the prepared CPU environment. Run the full unit and workflow integration regression suite with:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+| Test module | Tests | Coverage |
+| --- | ---: | --- |
+| `test_compatibility.py` | 5 | Genius constructor API, metadata stream handling/fallback, PyAV decoder compatibility |
+| `test_genius_urls.py` | 6 | URL validation, preview/approval, replacement queries, explicit fallback consent |
+| `test_gpu_alignment.py` | 3 | Mocked CUDA availability, dtype preservation and alignment options |
+| `test_lyric_selection.py` | 3 | Filename queries, Genius bypass of ASR, consented ASR workflow |
+| `test_no_speech.py` | 4 | Empty-recognition retry, manual lyrics and Skip |
+| `test_timing_fallbacks.py` | 9 | Stanza/cursor logic, Demucs invocation, invalid timing, review flags, exhausted audio and WAV duration |
+| `test_walkman_encoding.py` | 3 | Unicode normalization, BOM bytes and exclusive output creation |
+| `test_workflow.py` | 6 | Recursive scan, consent, timestamp formatting, LRC output and safe TXT cleanup |
+| `test_practical_features.py` | 10 | Single-file scans, invalid paths, accent export, CPU VAD, onset bounds and no-vocal failure |
+| **Total** | **49** | **Unit and workflow integration regressions** |
+
+Model/API doubles isolate most external operations. The duration test reads an actual generated PCM WAV using Python's `wave` module; it is not an ffprobe integration test. New coverage checks the real bundled Silero model on generated silence on CPU and uses mocked detections to verify vocal-onset cropping and stanza overlap. Existing timing/GPU fixtures mock the onset helper to isolate their original assertions. Passing these tests does not establish live Genius access, real singing/alignment quality, CUDA execution, Demucs separation quality, or physical NW-S644 rendering. Those checks require the relevant dependencies, weights, credentials, hardware and representative audio.
+
+### Implementation map and recent changes
+
+| Module | Responsibility |
+| --- | --- |
+| `main.py` | CLI, interactive orchestration, optional accent removal, output creation and post-success TXT cleanup |
+| `scanner.py` | File/folder track discovery, filename queries and optional metadata |
+| `genius_fetcher.py` | Genius approval flow, URL host checks and stanza-preserving text cleanup |
+| `comparator.py` | Fallback ASR, decoder compatibility and separately available text-comparison helpers |
+| `aligner.py` | Optional vocal separation, CPU Silero onset detection, stanza alignment, timing validation, review flags and BOM writing |
+
+Recent implementation history: `a6c15b9` fixed Genius/PyAV compatibility; `f355429` introduced the stanza engine and review flags; `5c433eb` updated stanza, GPU-option and TXT-cleanup regressions; `40426da` updated ignore rules. This README describes the resulting implementation rather than earlier whole-song alignment/retry behavior.
+
+The current working-tree upgrade adds file-path inputs, the Silero onset guard and optional accent stripping on top of those commits; `comparator.py` is unchanged.

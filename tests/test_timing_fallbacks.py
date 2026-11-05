@@ -20,6 +20,9 @@ def result(*rows):
 
 class TimingTests(unittest.TestCase):
     def setUp(self):
+        vad = patch('aligner.first_vocal_start', return_value=0.0)
+        vad.start()
+        self.addCleanup(vad.stop)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.audio = Path(self.directory.name) / 'audio.wav'

@@ -4,3 +4,4 @@ rapidfuzz>=3.9,<4
 lyricsgenius>=3.0,<4
 mutagen>=1.47,<2
 tqdm>=4.66,<5
+silero-vad>=6,<7
