@@ -108,6 +108,7 @@ class VocalOnsetTests(unittest.TestCase):
 
     def test_onset_bounds_first_stanza_and_preserves_overlap(self):
         aligner = Aligner.__new__(Aligner)
+        aligner.device = 'cpu'
         aligner.model = SimpleNamespace(align=Mock(side_effect=[
             SimpleNamespace(segments=[SimpleNamespace(start=0, end=2)]),
             SimpleNamespace(segments=[SimpleNamespace(start=1, end=3)]),
@@ -122,6 +123,7 @@ class VocalOnsetTests(unittest.TestCase):
 
     def test_no_vocals_does_not_call_alignment(self):
         aligner = Aligner.__new__(Aligner)
+        aligner.device = 'cpu'
         aligner.model = Mock()
         with patch('aligner.prepare_audio', return_value=self.audio), patch(
             'aligner.first_vocal_start', side_effect=ValueError('no vocals')

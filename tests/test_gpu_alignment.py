@@ -12,13 +12,14 @@ class GPUAlignmentTests(unittest.TestCase):
         load = Mock(return_value=model)
         torch = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True))
         with patch('aligner.first_vocal_start', return_value=0.0), \
-             patch('aligner.prepare_audio'), \
+             patch('aligner.prepare_audio') as prepare, \
              patch('aligner.save_audio_suffix', return_value=(0, 10)), \
              patch('aligner.audio_duration', return_value=10), patch.dict('sys.modules', {'torch': torch,
                                        'stable_whisper': SimpleNamespace(load_model=load)}):
             aligner = Aligner('small', 'cuda')
             self.assertEqual(aligner.align('audio.wav', 'Original'), '[00:01.00] Original\n')
         load.assert_called_once_with('small', device='cuda')
+        self.assertEqual(prepare.call_args.kwargs, {'device': 'cuda'})
         model.to.assert_not_called()
         model.half.assert_not_called()
         model.float.assert_not_called()

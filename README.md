@@ -30,12 +30,15 @@ The ASR fallback processes the original audio with `vad_filter=False`, `no_speec
 When the `demucs` executable is on PATH, alignment first separates the **entire track once** using:
 
 ```sh
+# CPU
 demucs --two-stems=vocals -n htdemucs -d cpu -o <temporary-directory> <audio-file>
+# GPU
+demucs --two-stems=vocals -n htdemucs_ft -d cuda --shifts 2 --overlap 0.5 -o <temporary-directory> <audio-file>
 ```
 
-The `htdemucs` vocal stem reduces instrumental accompaniment and may improve alignment, but complete removal of noise/instruments or improved recognition is not guaranteed. This preparation occurs after lyric selection; it does not preprocess the separate ASR fallback.
+CPU separation uses `htdemucs` with no explicit shifts/overlap overrides. CUDA separation uses the refinement model `htdemucs_ft`, two shifts and 0.5 overlap to improve vocal isolation at additional compute/memory cost. These settings aim to reduce accompaniment artifacts, including heavy beats, but complete removal of noise/instruments or improved recognition is not guaranteed. This preparation occurs after lyric selection; it does not preprocess the separate ASR fallback.
 
-Demucs is optional and installed separately. It runs on CPU even when alignment uses CUDA, with a 1,800-second timeout. Failure or missing/empty vocal output emits a warning and falls back to the original audio. FFmpeg then decodes the selected source to **16 kHz mono, signed 16-bit PCM WAV**. Temporary stems and decoded audio are removed after processing; the original audio is not modified.
+Demucs is optional and installed separately. It uses the same selected device as ASR and alignment, with a 1,800-second timeout. Its vocal output is read from the selected model's directory (`htdemucs` or `htdemucs_ft`). Failure or missing/empty vocal output emits a warning and falls back to the original audio. FFmpeg then decodes the selected source to **16 kHz mono, signed 16-bit PCM WAV**. Temporary stems and decoded audio are removed after processing; the original audio is not modified.
 
 ### Silence handling and stanza-guided alignment
 
@@ -203,10 +206,25 @@ For Genius search/direct URL lookup, create a Genius API client and set `GENIUS_
 
 ## 4. CLI reference
 
+### Session hardware selection
+
+If `--device` is omitted in an interactive terminal, the CLI checks `torch.cuda.is_available()`. When CUDA is available, it shows the GPU name and asks once before processing any track:
+
+```text
+GPU detected: [GPU Name]. Do you want to process with [1] GPU (fast, high quality) or [2] CPU (default [1]):
+```
+
+Press Enter or `1` for CUDA, or `2` for CPU. Invalid answers are requested again before processing starts. The chosen device is reused for every song in that invocation: faster-whisper ASR, stable-ts alignment and Demucs separation all receive it. This choice is not saved between separate CLI runs. GPU refinement may use more VRAM and download additional `htdemucs_ft` weights; speed and output quality depend on the hardware and material.
+
+An explicit `--device cuda` or `--device cpu` overrides automatic selection and never prompts. Without CUDA, or with redirected/captured non-interactive stdin, the default is CPU and no hardware input is requested. If an interactive prompt encounters EOF/unavailable input, it uses its displayed default, GPU. `--scan-only` and scans with no pending tracks skip hardware selection entirely. Existing lyric-approval prompts remain interactive; use explicit device flags for predictable hardware selection in scripts.
+
+The default ASR compute type follows the final selection (`float16` on CUDA, `int8` on CPU); `--compute-type` overrides it. Silero VAD and FFmpeg decoding retain their CPU implementation.
+
 Run commands from the repository root with the virtual environment active:
 
 ```sh
 python main.py "E:\Music" --scan-only
+python main.py "E:\Music" --language vi  # interactive hardware choice
 python main.py "E:\Music" --device cuda --language vi
 python main.py "E:\Music\song.mp3" --language vi --strip-vietnamese-accents
 python main.py "E:\Music\Japanese Album" --device cpu --language ja
@@ -217,7 +235,7 @@ python main.py --help
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `location` (required positional) | — | Supported audio **file** or music **folder** to scan recursively |
-| `--device` | `cpu` | `cpu` or `cuda` for ASR and alignment; Demucs remains on CPU |
+| `--device` | Interactive choice on CUDA hosts; otherwise `cpu` | Explicit `cpu` or `cuda` for ASR, alignment and Demucs; bypasses hardware prompt |
 | `--language` | `en` | Audio language code, for example `en`, `vi`, or `ja` |
 | `--model` | `small` | Faster-whisper ASR model name or local model directory; used only on fallback |
 | `--alignment-model` | `small` | Stable-ts/OpenAI Whisper model name or local checkpoint |
@@ -233,7 +251,7 @@ Exit status: `0` for completion and normal skip paths, `1` when a track exceptio
 
 ## 5. Quality assurance
 
-**Latest validation: 58/58 tests passed (all 49 previous tests plus 9 recovery regressions)**, with no failures or skips, on Python 3.12 in the prepared CPU environment. Run the full unit and workflow integration regression suite with:
+**Latest validation: 68/68 tests passed (all 58 previous tests plus 10 hardware-selection regressions)**, with no failures or skips, on Python 3.12 in the prepared CPU environment. Run the full unit and workflow integration regression suite with:
 
 ```sh
 python -m unittest discover -s tests -v
@@ -251,7 +269,8 @@ python -m unittest discover -s tests -v
 | `test_workflow.py` | 6 | Recursive scan, consent, timestamp formatting, LRC output and safe TXT cleanup |
 | `test_practical_features.py` | 10 | Single-file scans, invalid paths, accent export, CPU VAD, onset bounds and no-vocal failure |
 | `test_refrain_recovery.py` | 9 | Repeated chorus rejection, bounded retry, VAD silence exceptions, paced fallback and PCM window bounds |
-| **Total** | **58** | **Unit and workflow integration regressions** |
+| `test_device_selection.py` | 10 | One-time GPU/CPU prompt, unattended defaults, session-wide ASR/aligner device propagation, Demucs commands/stem paths and failure fallback |
+| **Total** | **68** | **Unit and workflow integration regressions** |
 
 Model/API doubles isolate most external operations. The duration test reads an actual generated PCM WAV using Python's `wave` module; it is not an ffprobe integration test. New coverage checks the real bundled Silero model on generated silence on CPU and uses mocked detections to verify vocal-onset cropping and stanza overlap. Existing timing/GPU fixtures mock the onset helper to isolate their original assertions. Passing these tests does not establish live Genius access, real singing/alignment quality, CUDA execution, Demucs separation quality, or physical NW-S644 rendering. Those checks require the relevant dependencies, weights, credentials, hardware and representative audio.
 
@@ -267,4 +286,4 @@ Model/API doubles isolate most external operations. The duration test reads an a
 
 Recent implementation history: `a6c15b9` fixed Genius/PyAV compatibility; `f355429` introduced the stanza engine and review flags; `5c433eb` updated stanza, GPU-option and TXT-cleanup regressions; `40426da` updated ignore rules. This README describes the resulting implementation rather than earlier whole-song alignment/retry behavior.
 
-Commit `7870287` added file-path inputs, the Silero onset guard and optional accent stripping. The repeated-chorus recovery adds a 40-second forward-jump limit, bounded local retries and paced estimates marked `[?]`, with nine regression tests. The text-comparison heuristics in `comparator.py` remain unchanged.
+Commit `7870287` added file-path inputs, the Silero onset guard and optional accent stripping. The repeated-chorus recovery adds a 40-second forward-jump limit, bounded local retries and paced estimates marked `[?]`, with nine regression tests. Hardware selection now propagates a session-wide CPU/CUDA choice to Demucs, ASR and alignment, with a refinement profile for CUDA. The text-comparison heuristics in `comparator.py` remain unchanged.

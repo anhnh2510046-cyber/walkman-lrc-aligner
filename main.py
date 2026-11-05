@@ -28,7 +28,8 @@ def parser():
         help='stable-ts model name or checkpoint',
     )
     result.add_argument(
-        '--device', default='cpu', choices=['cpu', 'cuda']
+        '--device', default=None, choices=['cpu', 'cuda'],
+        help='Processing device (prompt on interactive CUDA hosts; otherwise CPU)',
     )
     result.add_argument(
         '--compute-type',
@@ -66,6 +67,36 @@ def strip_vietnamese_accents(text):
     ).replace('đ', 'd').replace('Đ', 'D')
 
 
+def select_device(requested=None):
+    """Choose once per invocation; explicit flags and unattended runs never ask."""
+    if requested is not None:
+        return requested
+    if not sys.stdin.isatty():
+        return 'cpu'
+
+    try:
+        import torch
+    except ImportError:
+        return 'cpu'
+    if not torch.cuda.is_available():
+        return 'cpu'
+
+    name = torch.cuda.get_device_name(0)
+    while True:
+        try:
+            choice = input(
+                f'GPU detected: {name}. Do you want to process with '
+                '[1] GPU (fast, high quality) or [2] CPU (default [1]): '
+            ).strip()
+        except (EOFError, OSError):
+            return 'cuda'
+        if choice in ('', '1'):
+            return 'cuda'
+        if choice == '2':
+            return 'cpu'
+        print('Please enter 1 for GPU or 2 for CPU.')
+
+
 def enter_manual_lyrics(ask=input, output=print):
     output('Whisper could not recognize this song.')
 
@@ -99,9 +130,6 @@ def main(argv=None):
     )):
         parser().error(f'Not a supported audio file or directory: {args.directory}')
 
-    compute_type = args.compute_type or (
-        'float16' if args.device == 'cuda' else 'int8'
-    )
     transcriber = aligner = None
     failures = 0
 
@@ -116,6 +144,13 @@ def main(argv=None):
             for track in tracks:
                 print(f'{track.path}: {track.artist} — {track.title}')
             return 0
+
+        if not tracks:
+            return 0
+        args.device = select_device(args.device)
+        compute_type = args.compute_type or (
+            'float16' if args.device == 'cuda' else 'int8'
+        )
 
         from tqdm import tqdm
 

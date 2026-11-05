@@ -61,11 +61,12 @@ def split_stanzas(lyrics, group_size=9):
     ]
 
 
-def prepare_audio(path, directory):
+def prepare_audio(path, directory, device='cpu'):
     """Optionally isolate the full track once, then decode to PCM WAV."""
     original = Path(path).resolve()
     directory = Path(directory)
     source = original
+    model_name = 'htdemucs_ft' if device == 'cuda' else 'htdemucs'
 
     demucs = shutil.which('demucs')
     if demucs:
@@ -74,8 +75,10 @@ def prepare_audio(path, directory):
                 [
                     demucs,
                     '--two-stems=vocals',
-                    '-n', 'htdemucs',
-                    '-d', 'cpu',
+                    '-n', model_name,
+                    '-d', device,
+                    *(['--shifts', '2', '--overlap', '0.5']
+                      if device == 'cuda' else []),
                     '-o', str(directory),
                     str(original),
                 ],
@@ -86,7 +89,7 @@ def prepare_audio(path, directory):
 
             vocals = (
                 directory
-                / 'htdemucs'
+                / model_name
                 / original.stem
                 / 'vocals.wav'
             )
@@ -417,7 +420,7 @@ class Aligner:
             prefix='walkman-stanzas-'
         ) as directory:
             root = Path(directory)
-            source = prepare_audio(path, root)
+            source = prepare_audio(path, root, device=self.device)
             duration = audio_duration(source)
             vocal_start = first_vocal_start(source)
             time_cursor = vocal_start

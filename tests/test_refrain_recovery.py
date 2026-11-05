@@ -35,6 +35,7 @@ class RefrainRecoveryTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.engine = Aligner.__new__(Aligner)
+        self.engine.device = 'cpu'
         self.engine.model = NS(align=Mock())
 
     def test_repeated_chorus_never_clumps_remaining_lyrics_at_outro(self):
